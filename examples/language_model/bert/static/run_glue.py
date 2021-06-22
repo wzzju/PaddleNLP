@@ -33,6 +33,7 @@ from paddlenlp.transformers import ErnieForSequenceClassification, ErnieTokenize
 from paddlenlp.transformers import LinearDecayWithWarmup
 from paddlenlp.metrics import Mcc, PearsonAndSpearman
 from paddlenlp.utils.log import logger
+import distutils
 
 METRIC_CLASSES = {
     "cola": Mcc,
@@ -146,6 +147,21 @@ def parse_args():
         type=str,
         default="gpu",
         help="Device for selecting for the training.")
+    parser.add_argument(
+        "--use_amp",
+        type=distutils.util.strtobool,
+        default=False,
+        help="Enable mixed precision training.")
+    parser.add_argument(
+        "--use_pure_fp16",
+        type=distutils.util.strtobool,
+        default=False,
+        help="Whether to use pure fp16 training.")
+    parser.add_argument(
+        "--scale_loss",
+        type=float,
+        default=128.0,
+        help="The value of scale_loss for fp16.")
     args = parser.parse_args()
     return args
 
@@ -191,6 +207,45 @@ def reset_program_state_dict(args, model, state_dict, pretrained_state_dict):
     logger.info("the following parameter had reset, please check. {}".format(
         reset_parameter_names))
     return reset_state_dict
+
+
+def create_strategy(args):
+    """
+    Create build strategy and exec strategy.
+    """
+    build_strategy = paddle.static.BuildStrategy()
+    exec_strategy = paddle.static.ExecutionStrategy()
+
+    exec_strategy.num_threads = 1
+    exec_strategy.num_iteration_per_drop_scope = 10000
+    return build_strategy, exec_strategy
+
+
+def dist_optimizer(args, optimizer):
+    """
+    Create a distributed optimizer based on a normal optimizer
+    """
+    build_strategy, exec_strategy = create_strategy(args)
+
+    dist_strategy = fleet.DistributedStrategy()
+    dist_strategy.execution_strategy = exec_strategy
+    dist_strategy.build_strategy = build_strategy
+
+    dist_strategy.fuse_grad_size_in_MB = 16
+    if args.use_amp:
+        dist_strategy.amp = True
+
+        custom_black_list = ['lookup_table',
+                             'lookup_table_v2'] if args.use_pure_fp16 else None
+        dist_strategy.amp_configs = {
+            'custom_white_list': ['softmax', 'layer_norm', 'gelu'],
+            'init_loss_scaling': args.scale_loss,
+            'custom_black_list': custom_black_list,
+            'use_pure_fp16': args.use_pure_fp16
+        }
+
+    optimizer = fleet.distributed_optimizer(optimizer, strategy=dist_strategy)
+    return optimizer
 
 
 def set_seed(args):
@@ -383,12 +438,15 @@ def do_train(args):
             epsilon=args.adam_epsilon,
             parameters=model.parameters(),
             weight_decay=args.weight_decay,
-            apply_decay_param_fun=lambda x: x in decay_params)
-        optimizer = fleet.distributed_optimizer(optimizer)
+            apply_decay_param_fun=lambda x: x in decay_params,
+            multi_precision=args.use_pure_fp16)
+        optimizer = dist_optimizer(args, optimizer)
         optimizer.minimize(loss)
 
     # Create the metric pass for the validation
     with paddle.static.program_guard(dev_program, startup_program):
+        if args.use_amp:
+            logits = paddle.cast(logits, dtype='float32')
         metric = metric_class()
         correct = metric.compute(logits, labels)
 
@@ -401,6 +459,9 @@ def do_train(args):
     reset_state_dict = reset_program_state_dict(args, model, state_dict,
                                                 pretrained_state_dict)
     paddle.static.set_program_state(main_program, reset_state_dict)
+
+    if args.use_amp:
+        optimizer.amp_init(place, test_program=dev_program)
 
     global_step = 0
     tic_train = time.time()
@@ -431,7 +492,7 @@ def do_train(args):
                     os.makedirs(output_dir)
                 paddle.static.save_inference_model(
                     os.path.join(output_dir, "model"),
-                    [input_ids, token_type_ids], [logits], exe)
+                    [input_ids, token_type_ids], [logits], exe, program=dev_program)
                 tokenizer.save_pretrained(output_dir)
             if global_step >= num_training_steps:
                 return

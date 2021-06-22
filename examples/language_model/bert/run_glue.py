@@ -165,6 +165,11 @@ def parse_args():
         default=False,
         help="Enable mixed precision training.")
     parser.add_argument(
+        "--use_pure_fp16",
+        type=distutils.util.strtobool,
+        default=False,
+        help="Whether to use pure fp16 training.")
+    parser.add_argument(
         "--scale_loss",
         type=float,
         default=2**15,
